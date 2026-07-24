@@ -103,6 +103,7 @@ import { registerAllIpc } from './app/register-ipc'
 import { createTray, refreshTrayMenu } from './app/tray'
 import { startLiveServices } from './app/lifecycle'
 import { getOverlayAttachStrategy } from './experimental'
+import { initializePoeOAuth } from './auth/poe-oauth-runtime'
 
 // ---- Linux display-server setup --------------------------------------------
 
@@ -277,6 +278,9 @@ if (!gotLock) {
 const installDir = IS_E2E ? process.cwd() : applyPendingUpdate()
 
 app.whenReady().then(() => {
+  void initializePoeOAuth().catch(() => {
+    // Auth state exposes a structured retryable error when initialization fails.
+  })
   if (!IS_E2E)
     getOverlayAttachStrategy(store).createInitialOverlay((store.get(PROFILE_VERSION_KEY) as GameVariant) ?? 1)
   setMainOverlayGetter(getOverlayWindow)

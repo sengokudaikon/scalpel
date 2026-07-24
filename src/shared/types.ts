@@ -48,7 +48,15 @@ export type { PoeProfile, PoeProfileSummary, ProfileSettingKey, ProfileSettingVa
 
 export type { LegacyAppSettings, AppSettings, RuntimeSettings } from './contracts/settings'
 
-export type { InstallManifest, Manifest, AuthResult } from './contracts/updates'
+export type { InstallManifest, Manifest } from './contracts/updates'
+export type {
+  PoeAuthErrorReason,
+  PoeAuthPersistence,
+  PoeAuthSnapshot,
+  PoeAuthStatus,
+  PoeAuthorizationPersistenceChoice,
+} from './contracts/poe-auth'
+export type { ListingActionRef, TradeActionErrorReason, TradeActionResult } from './contracts/trade-actions'
 
 export type { HistoryEntry, FilterChange, FilterVersion } from './contracts/history'
 

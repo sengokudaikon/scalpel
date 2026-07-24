@@ -1,8 +1,12 @@
-import { app, BrowserWindow, ipcMain, net, session, shell } from 'electron'
+import { ipcMain, shell } from 'electron'
 import type Store from 'electron-store'
-import { getTradeUrls, POE_WEBSITE } from '@shared/endpoints'
-import type { AppSettings, AuthResult } from '@shared/types'
+import type { PoeAuthorizationPersistenceChoice } from '@shared/contracts/poe-auth'
+import type { ListingActionRef, TradeActionResult } from '@shared/contracts/trade-actions'
+import type { AppSettings } from '@shared/types'
+import { getPoeOAuthManager } from '../auth/poe-oauth-runtime'
+import { loadPoeOAuthConfig } from '../auth/poe-oauth-config'
 import { getPoeVersion } from '../game-state'
+import { trySendTradeChatAction } from '../hotkeys'
 import { getProfileBackedSetting } from '../profiles/profile-settings'
 import type { BulkExchangeResult, StatFilter, TradeResult } from '../trade/trade'
 import {
@@ -15,217 +19,80 @@ import {
   searchTabletsByRegex,
   searchTrade,
   searchWaystonesByRegex,
-  setTradeAuthCookie,
+  setTradeAccessTokenProvider,
 } from '../trade/trade'
+import { ListingActionRegistry } from '../trade/listing-action-registry'
+import {
+  ApprovedApiMerchantTravelProvider,
+  ExternalBrowserMerchantTravelProvider,
+  selectMerchantTravelProvider,
+} from '../trade/merchant-travel'
 
-async function clickTradeButton(
-  queryId: string,
-  listingId: string,
-  league: string,
-  buttonType: 'direct' | 'whisper',
-): Promise<string> {
-  const tradeUrl = getTradeUrls(getPoeVersion()).webSearch(league, queryId)
+const listingActions = new ListingActionRegistry()
+const activeActions = new Set<string>()
 
-  // Use a separate session partition but copy the POESESSID cookie from the default session
-  const tradeSession = session.fromPartition('trade-headless', { cache: false })
+function registerListings(queryId: string, league: string, listings: TradeResult['listings']): void {
+  listingActions.register(queryId, league, getPoeVersion(), listings)
+  // Merchant action tokens are main-process-only capabilities and must not
+  // cross IPC with the renderer-facing listing.
+  for (const listing of listings) delete listing.merchantToken
+}
 
-  // Copy all pathofexile.com cookies from default session (POESESSID, cf_clearance, etc.)
-  try {
-    const cookies = await session.defaultSession.cookies.get({ domain: '.pathofexile.com' })
-    const cookies2 = await session.defaultSession.cookies.get({ domain: 'pathofexile.com' })
-    const cookies3 = await session.defaultSession.cookies.get({ domain: 'www.pathofexile.com' })
-    for (const cookie of [...cookies, ...cookies2, ...cookies3]) {
-      await tradeSession.cookies
-        .set({
-          url: POE_WEBSITE,
-          name: cookie.name,
-          value: cookie.value,
-          domain: cookie.domain ?? '.pathofexile.com',
-          path: cookie.path ?? '/',
-          secure: cookie.secure,
-          httpOnly: cookie.httpOnly,
-        })
-        .catch(() => {})
-    }
-  } catch {
-    /* no cookies */
+function actionFailure(
+  action: 'whisper' | 'hideout' | 'instant-buy',
+  reason: Extract<TradeActionResult, { ok: false }>['reason'],
+  message: string,
+  retryable = false,
+): TradeActionResult {
+  return { ok: false, action, reason, message, retryable }
+}
+
+async function runChatAction(ref: ListingActionRef, kind: 'whisper' | 'hideout'): Promise<TradeActionResult> {
+  const listing = listingActions.get(ref.queryId, ref.listingId)
+  if (!listing) return actionFailure(kind, 'listing-not-found', 'This fetched listing is no longer available.')
+  if (listing.instantBuyout) {
+    return actionFailure(kind, 'wrong-listing-kind', 'Instant-buy listings must be opened through Instant Buy.')
   }
-
-  const hiddenWindow = new BrowserWindow({
-    width: 1200,
-    height: 800,
-    show: false,
-    webPreferences: {
-      nodeIntegration: false,
-      contextIsolation: true,
-      session: tradeSession,
-    },
-  })
-
-  // Block images, fonts, stylesheets, media to speed up page load
-  tradeSession.webRequest.onBeforeRequest({ urls: ['*://*/*'] }, (details, callback) => {
-    const url = details.url
-    if (
-      url.endsWith('.png') ||
-      url.endsWith('.jpg') ||
-      url.endsWith('.gif') ||
-      url.endsWith('.webp') ||
-      url.endsWith('.woff') ||
-      url.endsWith('.woff2') ||
-      url.endsWith('.ttf') ||
-      url.includes('google-analytics') ||
-      url.includes('googletagmanager') ||
-      url.includes('sentry') ||
-      url.includes('analytics')
-    ) {
-      callback({ cancel: true })
-    } else {
-      callback({})
-    }
-  })
-
-  let clicked = 'timeout'
+  const text =
+    kind === 'whisper' ? listing.whisper : listing.characterName ? `/hideout ${listing.characterName}` : undefined
+  if (!text) {
+    return actionFailure(
+      kind,
+      kind === 'whisper' ? 'missing-whisper' : 'missing-character',
+      kind === 'whisper' ? 'The trade API did not provide a whisper.' : 'The listing has no seller character name.',
+    )
+  }
+  const key = `${kind}:${ref.queryId}:${ref.listingId}`
+  if (activeActions.has(key)) return actionFailure(kind, 'action-in-progress', 'That action is already in progress.')
+  activeActions.add(key)
   try {
-    await hiddenWindow.loadURL(tradeUrl)
-
-    // Poll for results to appear instead of fixed delay
-    for (let attempt = 0; attempt < 20; attempt++) {
-      await new Promise((r) => setTimeout(r, 250))
-      // Direct Whisper button handles both: sends whisper for in-person, travels to hideout for instant buyout
-      const btnSelector = '.direct-btn'
-      // Sanitize listingId to prevent JS injection via executeJavaScript
-      const safeId = JSON.stringify(listingId)
-      const safeBtnSel = JSON.stringify(btnSelector)
-      const safeType = JSON.stringify(buttonType)
-      const result = await hiddenWindow.webContents.executeJavaScript(`
-        (function() {
-          const targetId = ${safeId};
-          const rows = document.querySelectorAll('[data-id]');
-          for (const row of rows) {
-            if (row.getAttribute('data-id') === targetId) {
-              const btn = row.querySelector(${safeBtnSel});
-              if (btn) { btn.click(); return 'clicked-' + ${safeType}; }
-              return 'no-button-found';
-            }
-          }
-          return rows.length > 0 ? 'listing-not-found' : 'loading';
-        })()
-      `)
-      if (result !== 'loading') {
-        clicked = result
-        break
-      }
+    const sent = await trySendTradeChatAction(text)
+    if (sent === 'game-not-found') {
+      return actionFailure(kind, 'game-not-found', 'Path of Exile could not be focused.', true)
     }
-
-    // Brief pause for the action to process
-    await new Promise((r) => setTimeout(r, 500))
-  } catch (e) {
-    console.error(`[trade] ${buttonType} failed:`, e)
+    if (sent === 'busy') return actionFailure(kind, 'action-in-progress', 'Another chat action is in progress.', true)
+    return { ok: true, action: kind, mode: 'game-chat' }
+  } catch {
+    return actionFailure(kind, 'game-not-found', 'Path of Exile could not be focused.', true)
   } finally {
-    hiddenWindow.close()
+    activeActions.delete(key)
   }
-  return clicked
-}
-
-function fetchPoeProfile(): Promise<AuthResult> {
-  return new Promise<AuthResult>((resolve) => {
-    const request = net.request({
-      url: `${POE_WEBSITE}/api/profile`,
-      method: 'GET',
-      useSessionCookies: true,
-    })
-    request.setHeader('Accept', 'application/json')
-    request.setHeader('User-Agent', app.userAgentFallback)
-
-    let settled = false
-    const timeout = setTimeout(() => {
-      if (settled) return
-      settled = true
-      request.abort()
-      console.error('[auth] profile check timed out')
-      resolve({ loggedIn: false })
-    }, 5000)
-
-    let data = ''
-    request.on('response', (response) => {
-      if (response.statusCode !== 200) {
-        if (settled) return
-        settled = true
-        clearTimeout(timeout)
-        resolve({ loggedIn: false })
-        return
-      }
-      response.on('data', (chunk: Buffer) => {
-        data += chunk.toString()
-      })
-      response.on('end', () => {
-        if (settled) return
-        settled = true
-        clearTimeout(timeout)
-        try {
-          const profile = JSON.parse(data) as { name?: string }
-          if (profile?.name) {
-            resolve({ loggedIn: true, accountName: profile.name })
-          } else {
-            console.warn('[auth] profile response has no name field, raw:', data)
-            resolve({ loggedIn: false })
-          }
-        } catch (e) {
-          console.error('[auth] profile JSON parse failed:', e, 'raw:', data)
-          resolve({ loggedIn: false })
-        }
-      })
-    })
-    request.on('error', () => {
-      if (settled) return
-      settled = true
-      clearTimeout(timeout)
-      resolve({ loggedIn: false })
-    })
-    request.end()
-  })
-}
-
-// Session-cached login state for gating weighted-sum searches. Refreshed lazily
-// (only when a search actually needs it) and cleared on login/logout so a fresh
-// login takes effect immediately; the TTL re-validates against server-side
-// session expiry without a network call on every search.
-let authCache: { loggedIn: boolean; at: number } | null = null
-const AUTH_CACHE_TTL_MS = 5 * 60 * 1000
-
-function setAuthCache(loggedIn: boolean): void {
-  authCache = { loggedIn, at: Date.now() }
-}
-
-// Fresh login check (uncached): no POESESSID cookie means logged out; otherwise
-// the profile endpoint decides. Shared by the cached gate and the poe-check-auth
-// IPC so the cookie + profile sequence lives in one place.
-async function checkAuthFresh(): Promise<AuthResult> {
-  try {
-    const cookies = await session.defaultSession.cookies.get({ domain: 'pathofexile.com', name: 'POESESSID' })
-    if (cookies.length === 0) {
-      setTradeAuthCookie(null)
-      return { loggedIn: false }
-    }
-    const result = await fetchPoeProfile()
-    // Only a confirmed login may attach POESESSID to trade requests -- an
-    // anonymous POESESSID is exactly what Cloudflare challenges (#429).
-    setTradeAuthCookie(result.loggedIn ? cookies[0].value : null)
-    return result
-  } catch {
-    setTradeAuthCookie(null)
-    return { loggedIn: false }
-  }
-}
-
-async function isLoggedInCached(): Promise<boolean> {
-  if (authCache && Date.now() - authCache.at < AUTH_CACHE_TTL_MS) return authCache.loggedIn
-  const { loggedIn } = await checkAuthFresh()
-  setAuthCache(loggedIn)
-  return loggedIn
 }
 
 export function register(store: Store<AppSettings>): void {
+  const auth = getPoeOAuthManager()
+  const oauthConfig = loadPoeOAuthConfig()
+  setTradeAccessTokenProvider((forceRefresh) => auth.getAccessToken(forceRefresh), oauthConfig?.userAgent)
+  const externalMerchant = new ExternalBrowserMerchantTravelProvider((url) => shell.openExternal(url))
+  const approvedMerchant =
+    oauthConfig?.instantBuyTravelApproved && oauthConfig.instantBuyTravelEndpoint
+      ? new ApprovedApiMerchantTravelProvider(
+          oauthConfig.instantBuyTravelEndpoint,
+          oauthConfig.instantBuyTravelApproved,
+          auth,
+        )
+      : null
+
   ipcMain.handle(
     'trade-search',
     async (
@@ -253,14 +120,18 @@ export function register(store: Store<AppSettings>): void {
       const collapse = store.get('tradeCollapseListings') ?? true
       // Only spend a login check when the search would carry a Weighted Sum group
       // (the trade API rejects those for anonymous users). Most searches skip it.
-      const loggedIn = searchNeedsLogin(statFilters) ? await isLoggedInCached() : true
-      return searchTrade(league, item, statFilters, {
+      const loggedIn = searchNeedsLogin(statFilters)
+        ? (await auth.getAccessToken()) !== null && auth.getSnapshot().capabilities.authenticatedTrade
+        : true
+      const result = await searchTrade(league, item, statFilters, {
         tradeStatus: status,
         tradePriceOption: price,
         listedTime: searchOptions?.listedTime,
         collapseListings: collapse,
         loggedIn,
       })
+      registerListings(result.queryId, league, result.listings)
+      return result
     },
   )
 
@@ -281,65 +152,31 @@ export function register(store: Store<AppSettings>): void {
     },
   )
 
-  ipcMain.handle('visit-hideout', async (_event, queryId: string, listingId: string, league: string) => {
-    return clickTradeButton(queryId, listingId, league, 'direct')
+  ipcMain.handle('whisper-seller', (_event, ref: ListingActionRef) => runChatAction(ref, 'whisper'))
+
+  ipcMain.handle('visit-hideout', (_event, ref: ListingActionRef) => runChatAction(ref, 'hideout'))
+
+  ipcMain.handle('instant-buy', async (_event, ref: ListingActionRef): Promise<TradeActionResult> => {
+    const listing = listingActions.get(ref.queryId, ref.listingId)
+    if (!listing)
+      return actionFailure('instant-buy', 'listing-not-found', 'This fetched listing is no longer available.')
+    if (!listing.instantBuyout) {
+      return actionFailure('instant-buy', 'wrong-listing-kind', 'This is an ordinary seller listing.')
+    }
+    const provider = selectMerchantTravelProvider(
+      approvedMerchant && listing.merchantToken ? approvedMerchant : null,
+      externalMerchant,
+    )
+    return provider.travel(listing, listingActions.exactSearchUrl(listing))
   })
 
-  ipcMain.handle('whisper-seller', async (_event, queryId: string, listingId: string, league: string) => {
-    return clickTradeButton(queryId, listingId, league, 'whisper')
+  ipcMain.handle('poe-login', (_event, choice?: PoeAuthorizationPersistenceChoice) => auth.startAuthorization(choice))
+  ipcMain.handle('poe-cancel-auth', () => auth.cancelAuthorization())
+  ipcMain.handle('poe-check-auth', async () => {
+    await auth.initialize()
+    return auth.getSnapshot()
   })
-
-  ipcMain.handle('poe-login', () => {
-    return new Promise<void>((resolve) => {
-      const LOGIN_TITLE = 'Login'
-      const loginWindow = new BrowserWindow({
-        width: 800,
-        height: 700,
-        title: LOGIN_TITLE,
-        autoHideMenuBar: true,
-        webPreferences: {
-          nodeIntegration: false,
-          contextIsolation: true,
-        },
-      })
-      // The PoE login page sets document.title to "Path of Exile", which our overlay
-      // matches by-title and would incorrectly attach to this login popup. Suppress the
-      // OS title update and re-assert our own title in case preventDefault alone isn't
-      // enough on some Windows setups.
-      loginWindow.webContents.on('page-title-updated', (event) => {
-        event.preventDefault()
-        loginWindow.setTitle(LOGIN_TITLE)
-      })
-      loginWindow.loadURL(`${POE_WEBSITE}/login`)
-
-      // Close window when user navigates to the account page (login complete)
-      loginWindow.webContents.on('did-navigate', (_event, url) => {
-        if (url.includes('pathofexile.com/my-account') || url === `${POE_WEBSITE}/`) {
-          loginWindow.close()
-        }
-      })
-
-      // Resolve after the window closes (user logged in or closed without logging
-      // in). Drop the cached login state so the next weighted search re-checks.
-      loginWindow.on('closed', () => {
-        authCache = null
-        resolve()
-      })
-    })
-  })
-
-  ipcMain.handle('poe-check-auth', async (): Promise<AuthResult> => {
-    // Warm the weighted-search login cache from the renderer's own auth check.
-    const result = await checkAuthFresh()
-    setAuthCache(result.loggedIn)
-    return result
-  })
-
-  ipcMain.handle('poe-logout', async () => {
-    await session.defaultSession.cookies.remove(POE_WEBSITE, 'POESESSID')
-    setTradeAuthCookie(null)
-    setAuthCache(false)
-  })
+  ipcMain.handle('poe-logout', () => auth.logout())
 
   ipcMain.handle('open-external', (_event, url: string) => {
     shell.openExternal(url)
@@ -378,6 +215,7 @@ export function register(store: Store<AppSettings>): void {
         tradePriceOption,
         collapse,
       )
+      registerListings(result.queryId, league, result.listings)
       return { ...result, league }
     },
   )
@@ -426,6 +264,7 @@ export function register(store: Store<AppSettings>): void {
         tradePriceOption,
         collapse,
       )
+      registerListings(result.queryId, league, result.listings)
       return { ...result, league }
     },
   )
@@ -459,11 +298,15 @@ export function register(store: Store<AppSettings>): void {
         tradePriceOption,
         collapse,
       )
+      registerListings(result.queryId, league, result.listings)
       return { ...result, league }
     },
   )
 
   ipcMain.handle('fetch-more-listings', async (_event, queryId: string, ids: string[]) => {
-    return fetchMoreListings(queryId, ids)
+    const result = await fetchMoreListings(queryId, ids)
+    listingActions.append(queryId, result.listings)
+    for (const listing of result.listings) delete listing.merchantToken
+    return result
   })
 }

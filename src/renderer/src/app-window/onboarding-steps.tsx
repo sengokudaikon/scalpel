@@ -340,7 +340,7 @@ export function TradeLoginStep({
   totalSteps: number
   onBackToSettings?: () => void
 }): JSX.Element {
-  const { auth, login, logout } = useAuth()
+  const { auth, login, cancel, logout } = useAuth()
 
   return (
     <div>
@@ -355,7 +355,9 @@ export function TradeLoginStep({
           <span className="value text-text-dim">{m.onb_trade_checking()}</span>
         ) : auth.loggedIn ? (
           <>
-            <span className="value text-accent">{m.onb_trade_logged_in({ account: auth.accountName })}</span>
+            <span className="value text-accent">
+              {m.onb_trade_logged_in({ account: auth.accountName ?? 'Path of Exile' })}
+            </span>
             <button
               className="text-[11px] text-text-dim shrink-0 ml-2 px-3 py-[5px]"
               onClick={() => {
@@ -365,20 +367,33 @@ export function TradeLoginStep({
               {m.common_logout()}
             </button>
           </>
+        ) : auth.status === 'authorizing' ? (
+          <>
+            <span className="value text-text-dim">Finish authorization in your browser…</span>
+            <button onClick={() => void cancel()}>Cancel</button>
+          </>
         ) : (
           <>
-            <span className="value text-text-dim">{m.onb_trade_not_logged_in()}</span>
-            <button
-              className="primary"
-              onClick={() => {
-                login()
-              }}
-            >
-              {m.common_login()}
-            </button>
+            <span className="value text-text-dim">
+              {auth.status === 'unavailable' ? 'OAuth unavailable' : m.onb_trade_not_logged_in()}
+            </span>
+            {auth.status !== 'unavailable' && (
+              <button className="primary" onClick={() => void login('encrypted')}>
+                Authorize in Browser
+              </button>
+            )}
           </>
         )}
       </div>
+      {auth?.error && <p className="text-[10px] text-text-dim -mt-4 mb-3">{auth.error.message}</p>}
+      {auth?.error?.reason === 'insecure-keyring' && (
+        <button className="text-[10px] mb-3" onClick={() => void login('memory-only')}>
+          Continue memory-only for this process
+        </button>
+      )}
+      <p className="text-[9px] text-text-dim mb-4">
+        This product isn&apos;t affiliated with or endorsed by Grinding Gear Games in any way.
+      </p>
       <NavButtons
         onBack={onBack}
         onNext={onNext}

@@ -105,6 +105,7 @@ export function tradeSearch(
     characterName?: string
     online: boolean
     instantBuyout: boolean
+    whisper?: string
     icon?: string
     indexed?: string
     itemData?: { name?: string; baseType?: string; explicitMods?: string[]; implicitMods?: string[]; ilvl?: number }
@@ -158,6 +159,7 @@ export function fetchMoreListings(
     characterName?: string
     online: boolean
     instantBuyout: boolean
+    whisper?: string
     icon?: string
     indexed?: string
     itemData?: {
@@ -175,25 +177,34 @@ export function fetchMoreListings(
   return window.api.fetchMoreListings(queryId, ids)
 }
 
-export function visitHideout(queryId: string, listingId: string, league: string): Promise<void> {
-  return window.api.visitHideout(queryId, listingId, league)
+export function visitHideout(queryId: string, listingId: string): Promise<import('@shared/types').TradeActionResult> {
+  return window.api.visitHideout(queryId, listingId)
 }
 
-export function whisperSeller(queryId: string, listingId: string, league: string): Promise<void> {
-  return window.api.whisperSeller(queryId, listingId, league)
+export function whisperSeller(queryId: string, listingId: string): Promise<import('@shared/types').TradeActionResult> {
+  return window.api.whisperSeller(queryId, listingId)
+}
+
+export function requestInstantBuy(
+  queryId: string,
+  listingId: string,
+): Promise<import('@shared/types').TradeActionResult> {
+  return window.api.requestInstantBuy(queryId, listingId)
 }
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
-export function poeLogin(): Promise<void> {
-  return window.api.poeLogin()
+export function poeLogin(
+  choice?: import('@shared/types').PoeAuthorizationPersistenceChoice,
+): Promise<import('@shared/types').PoeAuthSnapshot> {
+  return window.api.poeLogin(choice)
 }
 
-export function poeCheckAuth(): Promise<import('@shared/contracts/updates').AuthResult> {
+export function poeCheckAuth(): Promise<import('@shared/types').PoeAuthSnapshot> {
   return window.api.poeCheckAuth()
 }
 
-export function poeLogout(): Promise<void> {
+export function poeLogout(): Promise<import('@shared/types').PoeAuthSnapshot> {
   return window.api.poeLogout()
 }
 

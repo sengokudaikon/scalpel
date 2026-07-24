@@ -4,12 +4,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 // electron's `net` at module scope, so the mock has to be installed before `./trade`
 // is loaded. Tests that don't care about captured requests (e.g. buildGemTypeField)
 // still work -- they just never call into a path that invokes net.request.
-const capturedRequests: Array<{ url: string; method: string; body?: string }> = []
+const capturedRequests: Array<{ url: string; method: string; body?: string; headers: Record<string, string> }> = []
 
 // Per-test override for the body the mocked net returns on a `/fetch/` request.
 // Default (null) keeps the empty-result body so request-asserting tests are
 // unaffected; response-parsing tests set this to feed a real fetch payload.
 let mockFetchBody: string | null = null
+let mockResponseStatuses: number[] = []
 
 interface CapturedTradeFilterGroup {
   filters: Record<string, { min?: number; option?: string }>
@@ -55,10 +56,11 @@ vi.mock('electron', () => ({
   app: { userAgentFallback: 'Scalpel-Test/1.0', on: vi.fn() },
   net: {
     request: vi.fn((opts: { url: string; method: string }) => {
-      const entry = { url: opts.url, method: opts.method } as {
+      const entry = { url: opts.url, method: opts.method, headers: {} } as {
         url: string
         method: string
         body?: string
+        headers: Record<string, string>
       }
       capturedRequests.push(entry)
       let responseCb: ((resp: unknown) => void) | null = null
@@ -66,7 +68,9 @@ vi.mock('electron', () => ({
         on: (event: string, cb: unknown) => {
           if (event === 'response') responseCb = cb as typeof responseCb
         },
-        setHeader: vi.fn(),
+        setHeader: vi.fn((name: string, value: string) => {
+          entry.headers[name] = value
+        }),
         write: vi.fn((body: string) => {
           entry.body = body
         }),
@@ -76,7 +80,7 @@ vi.mock('electron', () => ({
             let dataCb: ((chunk: unknown) => void) | null = null
             let endCb: (() => void) | null = null
             responseCb({
-              statusCode: 200,
+              statusCode: mockResponseStatuses.shift() ?? 200,
               headers: {},
               on: (event: string, cb: unknown) => {
                 if (event === 'data') dataCb = cb as typeof dataCb
@@ -114,6 +118,7 @@ import {
   searchTabletsByRegex,
   searchWaystonesByRegex,
   searchNeedsLogin,
+  setTradeAccessTokenProvider,
   stripTradeTokens,
   _resetRateLimitsForTests,
   type FetchEntry,
@@ -134,6 +139,63 @@ const bodyArmourItem = {
   evasion: 542,
   energyShield: 203,
 }
+
+describe('trade request authentication', () => {
+  beforeEach(() => {
+    capturedRequests.length = 0
+    _resetRateLimitsForTests()
+    setPoeVersion(2)
+    setTradeAccessTokenProvider(null)
+    mockResponseStatuses = []
+  })
+
+  afterEach(() => setTradeAccessTokenProvider(null))
+
+  it('sends neither OAuth nor cookie headers for anonymous trade requests', async () => {
+    await searchTrade('Standard', bodyArmourItem, [], {
+      tradeStatus: 'any',
+      tradePriceOption: 'exalted_divine',
+    })
+    expect(capturedRequests.length).toBeGreaterThan(0)
+    for (const request of capturedRequests) {
+      expect(request.headers.Authorization).toBeUndefined()
+      expect(request.headers.Cookie).toBeUndefined()
+    }
+  })
+
+  it('uses Bearer authorization and never a POESESSID cookie', async () => {
+    setTradeAccessTokenProvider(vi.fn().mockResolvedValue('oauth-access-token'))
+    await searchTrade('Standard', bodyArmourItem, [], {
+      tradeStatus: 'any',
+      tradePriceOption: 'exalted_divine',
+    })
+    expect(capturedRequests.length).toBeGreaterThan(0)
+    for (const request of capturedRequests) {
+      expect(request.headers.Authorization).toBe('Bearer oauth-access-token')
+      expect(request.headers.Cookie).toBeUndefined()
+    }
+  })
+
+  it('refreshes once and retries once after an authenticated 401', async () => {
+    let refreshed = false
+    const provider = vi.fn(async (forceRefresh?: boolean) => {
+      if (forceRefresh) refreshed = true
+      return refreshed ? 'new-access-token' : 'old-access-token'
+    })
+    setTradeAccessTokenProvider(provider)
+    mockResponseStatuses = [401, 200]
+
+    await searchTrade('Standard', bodyArmourItem, [], {
+      tradeStatus: 'any',
+      tradePriceOption: 'exalted_divine',
+    })
+
+    expect(provider).toHaveBeenCalledWith(true)
+    expect(capturedRequests).toHaveLength(2)
+    expect(capturedRequests[0].headers.Authorization).toBe('Bearer old-access-token')
+    expect(capturedRequests[1].headers.Authorization).toBe('Bearer new-access-token')
+  })
+})
 
 describe('buildGemTypeField', () => {
   it('returns baseType as a plain string for a regular gem', () => {

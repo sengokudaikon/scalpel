@@ -5,6 +5,7 @@ export interface Listing {
   characterName?: string
   online: boolean
   instantBuyout: boolean
+  whisper?: string
   icon?: string
   indexed?: string
   itemData?: {

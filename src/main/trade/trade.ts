@@ -151,6 +151,7 @@ interface TradeListing {
   characterName?: string
   online: boolean
   whisper?: string
+  merchantToken?: string
   instantBuyout: boolean
   icon?: string
   indexed?: string
@@ -378,30 +379,23 @@ function categoryFor(url: string): RateLimitCategory {
   return 'search'
 }
 
-// ─── Trade auth cookie ────────────────────────────────────────────────────────
-//
-// Trade requests deliberately send NO session cookies: GGG's API mints an
-// anonymous POESESSID on its own responses, and Cloudflare bot-challenges any
-// /api/trade2 request that echoes it back (verified A/B: cookie-less requests
-// pass, cookie-carrying ones are challenged from the second request on, #429).
-// A genuinely logged-in POESESSID still has to reach the API for weighted-sum
-// searches, so the auth flow pushes it here and we attach it by hand.
-let tradeAuthCookie: string | null = null
+// ─── Trade OAuth -------------------------------------------------------------
 
-/** Set (on confirmed login) or clear (logout / failed auth check) the
- *  POESESSID attached to trade API requests. */
-export function setTradeAuthCookie(value: string | null): void {
-  tradeAuthCookie = value
+export type TradeAccessTokenProvider = (forceRefresh?: boolean) => Promise<string | null>
+let tradeAccessTokenProvider: TradeAccessTokenProvider | null = null
+let tradeOAuthUserAgent: string | null = null
+
+/** The OAuth manager remains the only owner of token material. */
+export function setTradeAccessTokenProvider(provider: TradeAccessTokenProvider | null, oauthUserAgent?: string): void {
+  tradeAccessTokenProvider = provider
+  tradeOAuthUserAgent = provider ? (oauthUserAgent ?? null) : null
 }
 
 // ─── HTTP helpers ─────────────────────────────────────────────────────────────
 //
 // Match the approach APT + EE2 use (verified in their main/src/proxy.ts):
-//   - `net.request` with `useSessionCookies: false`: GGG's API mints an
-//     anonymous POESESSID on its own responses, and Cloudflare bot-challenges
-//     any request that echoes it back (#429). Never let Electron attach the
-//     session cookie jar; a logged-in POESESSID is injected by hand in
-//     setTradeHeaders when the auth flow provides one.
+//   - `net.request` with `useSessionCookies: false`: no Electron session cookie
+//     is ever attached. Authenticated requests use only an OAuth Bearer token.
 //   - No `Origin`, no `Referer`, no `Sec-Fetch-*`, no `Accept-Language`. APT
 //     actively strips these from their proxy -- sending them puts us in a
 //     stricter bucket than the trade website.
@@ -418,11 +412,11 @@ function commonRequestOpts(url: string, method: string): Electron.ClientRequestC
   }
 }
 
-function setTradeHeaders(request: Electron.ClientRequest): void {
+function setTradeHeaders(request: Electron.ClientRequest, accessToken: string | null): void {
   request.setHeader('Content-Type', 'application/json')
   request.setHeader('Accept', 'application/json')
-  request.setHeader('User-Agent', app.userAgentFallback)
-  if (tradeAuthCookie) request.setHeader('Cookie', `POESESSID=${tradeAuthCookie}`)
+  request.setHeader('User-Agent', accessToken && tradeOAuthUserAgent ? tradeOAuthUserAgent : app.userAgentFallback)
+  if (accessToken) request.setHeader('Authorization', `Bearer ${accessToken}`)
 }
 
 // Hard ceiling on a single HTTP attempt. electron's `net.request` has no
@@ -440,16 +434,14 @@ async function fetchJson(url: string, options?: { method?: string; body?: string
   // firing under normal use. Seed limiters handle the first request before
   // we've seen a response's headers.
   await RateLimiter.waitMulti(RATE_LIMIT_RULES[category])
-  // One-shot auth-cookie drop for Cloudflare challenges (see the challenged
-  // branch below): attempted once per call when a logged-in POESESSID is
-  // active, then we surface the error.
-  let challengeResetDone = false
+  let authRetryDone = false
   for (let attempt = 0; attempt <= retries; attempt++) {
     const started = Date.now()
     try {
+      const accessToken = tradeAccessTokenProvider ? await tradeAccessTokenProvider(false) : null
       const result = await new Promise((resolve, reject) => {
         const request = net.request(commonRequestOpts(url, options?.method ?? 'GET'))
-        setTradeHeaders(request)
+        setTradeHeaders(request, accessToken)
 
         // Abort+reject on no-response-within-timeout. Single-shot so retries
         // from the rate-limit path stay in charge of when to try again.
@@ -467,6 +459,11 @@ async function fetchJson(url: string, options?: { method?: string; body?: string
 
         let data = ''
         request.on('response', (response) => {
+          if (response.statusCode === 401 && accessToken) {
+            clearTimeout(timer)
+            reject({ unauthorized: true })
+            return
+          }
           // Two things happen with rate-limit headers on every response:
           //   1. Proactive limiters get re-synced against the server's
           //      advertised buckets so the *next* waitMulti knows the truth.
@@ -569,6 +566,15 @@ async function fetchJson(url: string, options?: { method?: string; body?: string
       })
       return result
     } catch (e: unknown) {
+      if (e && typeof e === 'object' && 'unauthorized' in e) {
+        if (!authRetryDone && tradeAccessTokenProvider) {
+          authRetryDone = true
+          await tradeAccessTokenProvider(true)
+          attempt--
+          continue
+        }
+        throw new Error('Path of Exile rejected the OAuth authorization')
+      }
       if (e && typeof e === 'object' && 'rateLimited' in e) {
         // With the proactive limiter, reaching this path means a hidden tier
         // we can't see in the response headers kicked in (GGG does bucket by
@@ -581,17 +587,6 @@ async function fetchJson(url: string, options?: { method?: string; body?: string
           edgeBlocked?: boolean
         }
         if (challenged) {
-          if (!challengeResetDone && attempt < retries && tradeAuthCookie) {
-            challengeResetDone = true
-            // The only cookie we ever send is the logged-in POESESSID; if the
-            // edge has started challenging that too, degrade to anonymous (the
-            // auth cache re-validates within minutes) rather than hard-fail.
-            recordMainBreadcrumb('trade 429 challenge: dropping auth cookie, retrying anonymously')
-            setTradeAuthCookie(null)
-            continue
-          }
-          // Anonymous cookie-less requests that still get challenged mean the
-          // edge is in an elevated mode nothing client-side can clear.
           throw new Error(
             "Cloudflare challenged Scalpel's connection to the trade site -- this is a bot check, not a rate limit. It usually clears on its own within a few minutes",
           )
@@ -1272,6 +1267,7 @@ export interface FetchEntry {
     account: { name: string; lastCharacterName?: string; online?: { status?: string } }
     indexed?: string
     whisper?: string
+    merchantToken?: string
     method?: string
     fee?: number
     offers?: unknown[]
@@ -1330,6 +1326,7 @@ export function parseFetchedListings(fetchedEntries: FetchEntry[]): TradeListing
     characterName: r.listing.account.lastCharacterName,
     online: r.listing.account.online?.status === 'online',
     whisper: r.listing.whisper,
+    merchantToken: r.listing.merchantToken,
     // `fee` is the PoE market fee charged on instant-buy-eligible listings. Present =
     // supports Travel to Hideout; absent = whisper-only. More reliable than `method` (always
     // 'psapi') or `whisper` (can be present as fallback on instant listings).
@@ -1683,6 +1680,7 @@ async function fetchAndMapListings(ids: string[], queryId: string): Promise<Trad
         account: { name: string; lastCharacterName?: string; online?: { status?: string } }
         indexed?: string
         whisper?: string
+        merchantToken?: string
         method?: string
         fee?: number
         offers?: unknown[]
@@ -1726,6 +1724,8 @@ async function fetchAndMapListings(ids: string[], queryId: string): Promise<Trad
     account: r.listing.account.name,
     characterName: r.listing.account.lastCharacterName,
     online: !!r.listing.account.online,
+    whisper: r.listing.whisper,
+    merchantToken: r.listing.merchantToken,
     instantBuyout: !!r.listing.fee,
     icon: r.item?.icon,
     indexed: r.listing.indexed,

@@ -81,6 +81,24 @@ npm install
 npm run dev
 ```
 
+### Path of Exile OAuth configuration
+
+Scalpel does not ship another application's OAuth client ID. An approved Scalpel public client must be supplied at
+runtime with these variables:
+
+- `SCALPEL_POE_OAUTH_CLIENT_ID` — Scalpel's registered public-client ID.
+- `SCALPEL_POE_OAUTH_REDIRECT_URIS` — exactly three comma-separated, registered
+  `http://127.0.0.1:<port>/<callback>` URLs. Scalpel binds the first available URL without changing its port or path.
+
+The client must use Authorization Code with PKCE, refresh tokens, and the
+`account:profile account:trade oauth:revoke` scopes described by the approved registration. If configuration is
+absent, the UI reports OAuth as unavailable and trade searches remain anonymous. As of July 24, 2026, GGG says it
+cannot process new application registrations.
+
+Instant-buy travel is not enabled by OAuth alone. It stays on the external-browser fallback unless Scalpel has
+written GGG approval and both `SCALPEL_POE_INSTANT_BUY_APPROVED=true` and the approved HTTPS
+`SCALPEL_POE_INSTANT_BUY_ACTION_URL` are supplied. Do not configure an endpoint discovered from the trade website.
+
 ## License
 
 This project is licensed under the [GNU Affero General Public License v3.0](LICENSE).
@@ -90,3 +108,5 @@ This project is licensed under the [GNU Affero General Public License v3.0](LICE
 Check out [Third Party Notices](THIRD-PARTY-NOTICES.md) for the homies that make the libaries that make apps like Scalpel possible.
 
 Special thanks to VZ and the contributors that make [poe.re](https://github.com/veiset/poe-vendor-string/issues). I genuinely could not have a functioning regex tool without their dedication to finding tens of thousands of unique regex tokens.
+
+This product isn't affiliated with or endorsed by Grinding Gear Games in any way.

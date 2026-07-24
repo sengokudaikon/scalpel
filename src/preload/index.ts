@@ -4,7 +4,6 @@ import type { BugReportResult, RendererDiagnosticPayload } from '@shared/diagnos
 import type { ExternalLinkTarget } from '@shared/external-link'
 import type {
   AppSettings,
-  AuthResult,
   FilterBlock,
   FilterChange,
   FilterListEntry,
@@ -19,6 +18,7 @@ import type {
   RuntimeSettings,
   Zone,
 } from '@shared/types'
+import type { PoeAuthSnapshot, PoeAuthorizationPersistenceChoice, TradeActionResult } from '@shared/types'
 import type { BoardLibrary, BoardSnapshot, BoardState } from '@shared/whiteboard-types'
 
 export const api = {
@@ -489,6 +489,7 @@ export const api = {
       characterName?: string
       online: boolean
       instantBuyout: boolean
+      whisper?: string
       icon?: string
       indexed?: string
       itemData?: { name?: string; baseType?: string; explicitMods?: string[]; implicitMods?: string[]; ilvl?: number }
@@ -536,6 +537,7 @@ export const api = {
       characterName?: string
       online: boolean
       instantBuyout: boolean
+      whisper?: string
       icon?: string
       indexed?: string
       itemData?: {
@@ -581,6 +583,7 @@ export const api = {
       characterName?: string
       online: boolean
       instantBuyout: boolean
+      whisper?: string
       icon?: string
       indexed?: string
       itemData?: {
@@ -613,6 +616,7 @@ export const api = {
       characterName?: string
       online: boolean
       instantBuyout: boolean
+      whisper?: string
       icon?: string
       indexed?: string
       itemData?: {
@@ -640,6 +644,7 @@ export const api = {
       characterName?: string
       online: boolean
       instantBuyout: boolean
+      whisper?: string
       icon?: string
       indexed?: string
       itemData?: {
@@ -654,13 +659,22 @@ export const api = {
     }>
     remainingIds: string[]
   }> => ipcRenderer.invoke('fetch-more-listings', queryId, ids),
-  visitHideout: (queryId: string, listingId: string, league: string): Promise<void> =>
-    ipcRenderer.invoke('visit-hideout', queryId, listingId, league),
-  whisperSeller: (queryId: string, listingId: string, league: string): Promise<void> =>
-    ipcRenderer.invoke('whisper-seller', queryId, listingId, league),
-  poeLogin: (): Promise<void> => ipcRenderer.invoke('poe-login'),
-  poeCheckAuth: (): Promise<AuthResult> => ipcRenderer.invoke('poe-check-auth'),
-  poeLogout: (): Promise<void> => ipcRenderer.invoke('poe-logout'),
+  visitHideout: (queryId: string, listingId: string): Promise<TradeActionResult> =>
+    ipcRenderer.invoke(IPC_CHANNELS.TRADE.VISIT_HIDEOUT, { queryId, listingId }),
+  whisperSeller: (queryId: string, listingId: string): Promise<TradeActionResult> =>
+    ipcRenderer.invoke(IPC_CHANNELS.TRADE.WHISPER_SELLER, { queryId, listingId }),
+  requestInstantBuy: (queryId: string, listingId: string): Promise<TradeActionResult> =>
+    ipcRenderer.invoke(IPC_CHANNELS.TRADE.INSTANT_BUY, { queryId, listingId }),
+  poeLogin: (choice?: PoeAuthorizationPersistenceChoice): Promise<PoeAuthSnapshot> =>
+    ipcRenderer.invoke(IPC_CHANNELS.TRADE.POE_LOGIN, choice),
+  poeCancelAuth: (): Promise<PoeAuthSnapshot> => ipcRenderer.invoke(IPC_CHANNELS.TRADE.POE_CANCEL_AUTH),
+  poeCheckAuth: (): Promise<PoeAuthSnapshot> => ipcRenderer.invoke(IPC_CHANNELS.TRADE.POE_CHECK_AUTH),
+  poeLogout: (): Promise<PoeAuthSnapshot> => ipcRenderer.invoke(IPC_CHANNELS.TRADE.POE_LOGOUT),
+  onPoeAuthChanged: (cb: (snapshot: PoeAuthSnapshot) => void): (() => void) => {
+    const handler = (_: Electron.IpcRendererEvent, snapshot: PoeAuthSnapshot): void => cb(snapshot)
+    ipcRenderer.on(IPC_CHANNELS.TRADE.POE_AUTH_CHANGED_EVENT, handler)
+    return () => ipcRenderer.removeListener(IPC_CHANNELS.TRADE.POE_AUTH_CHANGED_EVENT, handler)
+  },
   openExternal: (url: string): Promise<void> => ipcRenderer.invoke('open-external', url),
   onGameBounds: (
     cb: (bounds: { gameWidth: number; gameHeight: number; sidebarWidth: number }) => void,

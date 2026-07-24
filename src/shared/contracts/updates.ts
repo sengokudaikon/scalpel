@@ -19,5 +19,3 @@ export interface Manifest {
   }
   poe2NinjaCategories: Record<string, string>
 }
-
-export type AuthResult = { loggedIn: true; accountName: string } | { loggedIn: false }

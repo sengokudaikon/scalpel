@@ -9,6 +9,7 @@ import { zebraRowBg } from '../utils'
 import { CurrencyIcon } from '../CurrencyIcon'
 import { formatPriceTooltip } from '../currency-short-labels'
 import { HoverTooltip } from '../HoverTooltip'
+import { useAuth } from '../use-auth'
 
 export function TradeListings({
   listings,
@@ -19,11 +20,11 @@ export function TradeListings({
   expandedListing,
   setExpandedListing,
   priceChipMinWidth,
-  loggedIn,
+  loggedIn: _loggedIn,
   actionStatus,
   setActionStatus,
   queryId,
-  league,
+  league: _league,
   onLoadMore,
   loadingMore,
   resultsView = 'default',
@@ -46,6 +47,7 @@ export function TradeListings({
   resultsView?: ResultsView
 }): JSX.Element {
   const poeVersion = usePoeVersion()
+  const { auth } = useAuth()
   const openAll = resultsView === 'open-all'
   const compact = resultsView === 'shrinkydink'
   const matchCount = total ?? listings.length
@@ -282,73 +284,110 @@ export function TradeListings({
                   )}
                 </div>
 
-                {/* Trade actions - only show when logged in */}
-                {loggedIn &&
+                {/* Every game action is a separate manual click and returns an explicit result. */}
+                {queryId &&
                   (() => {
-                    const status = actionStatus[l.id]
-                    const isActing = status === 'pending'
-                    const isDone = status === 'success' || status === 'failed'
-                    const label = l.instantBuyout
-                      ? isActing
-                        ? 'Traveling...'
-                        : isDone
-                          ? status === 'success'
-                            ? 'Success'
-                            : 'Failed'
-                          : 'Travel to Hideout'
-                      : isActing
-                        ? 'Whispering...'
-                        : isDone
-                          ? status === 'success'
-                            ? 'Whisper Sent'
-                            : 'Failed'
-                          : 'Whisper'
+                    const whisperKey = `${l.id}:whisper`
+                    const hideoutKey = `${l.id}:hideout`
+                    const instantKey = `${l.id}:instant`
+                    const run = async (
+                      event: React.MouseEvent,
+                      key: string,
+                      invoke: () => Promise<import('@shared/types').TradeActionResult>,
+                    ): Promise<void> => {
+                      event.stopPropagation()
+                      if (actionStatus[key] === 'pending') return
+                      setActionStatus((prev) => ({ ...prev, [key]: 'pending' }))
+                      try {
+                        const result = await invoke()
+                        setActionStatus((prev) => ({ ...prev, [key]: result.ok ? 'success' : 'failed' }))
+                      } catch {
+                        setActionStatus((prev) => ({ ...prev, [key]: 'failed' }))
+                      }
+                    }
+                    const actionClass =
+                      'px-2 py-[3px] text-[9px] font-semibold border-none rounded-[3px] shrink-0 whitespace-nowrap bg-white/[0.06] hover:bg-white/[0.12] text-text-dim hover:text-text disabled:opacity-50'
+                    if (l.instantBuyout) {
+                      const status = actionStatus[instantKey]
+                      const approved = auth?.capabilities.instantBuyTravel === true
+                      return (
+                        <button
+                          className={actionClass}
+                          disabled={status === 'pending'}
+                          title={
+                            approved
+                              ? 'Use the GGG-approved instant-buy travel action'
+                              : 'Open this exact instant-buy search in your browser'
+                          }
+                          onClick={(event) =>
+                            void run(event, instantKey, () => window.api.requestInstantBuy(queryId, l.id))
+                          }
+                        >
+                          {status === 'pending'
+                            ? approved
+                              ? 'Traveling…'
+                              : 'Opening…'
+                            : status === 'failed'
+                              ? 'Failed'
+                              : approved
+                                ? 'Travel to Hideout'
+                                : 'Open Instant Buy'}
+                        </button>
+                      )
+                    }
+                    const whisperStatus = actionStatus[whisperKey]
+                    const hideoutStatus = actionStatus[hideoutKey]
                     return (
-                      <button
-                        onClick={async (e) => {
-                          e.stopPropagation()
-                          if (isActing || !queryId) return
-                          setActionStatus((prev) => ({ ...prev, [l.id]: 'pending' }))
-                          try {
-                            if (l.instantBuyout) {
-                              await window.api.visitHideout(queryId, l.id, league)
-                            } else {
-                              await window.api.whisperSeller(queryId, l.id, league)
+                      <div className="flex items-center gap-1">
+                        {l.whisper && (
+                          <>
+                            <button
+                              className={actionClass}
+                              disabled={whisperStatus === 'pending' || whisperStatus === 'success'}
+                              title="Send the API-provided whisper as one manually invoked chat action"
+                              onClick={(event) =>
+                                void run(event, whisperKey, () => window.api.whisperSeller(queryId, l.id))
+                              }
+                            >
+                              {whisperStatus === 'pending'
+                                ? 'Whispering…'
+                                : whisperStatus === 'success'
+                                  ? 'Whisper Sent'
+                                  : whisperStatus === 'failed'
+                                    ? 'Retry Whisper'
+                                    : 'Whisper Seller'}
+                            </button>
+                            <button
+                              className={actionClass}
+                              title="Copy the API-provided whisper without controlling the game"
+                              onClick={(event) => {
+                                event.stopPropagation()
+                                void navigator.clipboard.writeText(l.whisper!)
+                              }}
+                            >
+                              Copy Whisper
+                            </button>
+                          </>
+                        )}
+                        {whisperStatus === 'success' && l.characterName && (
+                          <button
+                            className={actionClass}
+                            disabled={hideoutStatus === 'pending'}
+                            title={`Send /hideout ${l.characterName} as one manually invoked command`}
+                            onClick={(event) =>
+                              void run(event, hideoutKey, () => window.api.visitHideout(queryId, l.id))
                             }
-                            setActionStatus((prev) => ({ ...prev, [l.id]: 'success' }))
-                          } catch {
-                            setActionStatus((prev) => ({ ...prev, [l.id]: 'failed' }))
-                          }
-                        }}
-                        disabled={isActing}
-                        title={l.instantBuyout ? 'Visit hideout via trade site' : 'Send whisper via trade site'}
-                        className="px-2 py-[3px] text-[9px] font-semibold border-none rounded-[3px] shrink-0 whitespace-nowrap"
-                        style={{
-                          background:
-                            status === 'success'
-                              ? 'rgba(40,80,40,0.4)'
-                              : status === 'failed'
-                                ? 'rgba(100,35,35,0.4)'
-                                : 'rgba(255,255,255,0.06)',
-                          color: status === 'success' ? '#fff' : status === 'failed' ? '#fff' : 'var(--text-dim)',
-                          cursor: isActing ? 'default' : 'pointer',
-                          opacity: isActing ? 0.6 : 1,
-                        }}
-                        onMouseEnter={(e) => {
-                          if (!isActing && !isDone) {
-                            e.currentTarget.style.background = 'rgba(255,255,255,0.12)'
-                            e.currentTarget.style.color = 'var(--text)'
-                          }
-                        }}
-                        onMouseLeave={(e) => {
-                          if (!isActing && !isDone) {
-                            e.currentTarget.style.background = 'rgba(255,255,255,0.06)'
-                            e.currentTarget.style.color = 'var(--text-dim)'
-                          }
-                        }}
-                      >
-                        {label}
-                      </button>
+                          >
+                            {hideoutStatus === 'pending'
+                              ? 'Visiting…'
+                              : hideoutStatus === 'success'
+                                ? 'Hideout Command Sent'
+                                : hideoutStatus === 'failed'
+                                  ? 'Retry Hideout'
+                                  : 'Visit Hideout'}
+                          </button>
+                        )}
+                      </div>
                     )
                   })()}
 

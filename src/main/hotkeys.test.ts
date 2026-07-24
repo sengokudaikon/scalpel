@@ -25,6 +25,14 @@ const overlayControllerState: { targetHasFocus: boolean; events: EventEmitter; t
 }
 
 const uiohookState: { listeners: Record<string, Array<(e: unknown) => void>> } = { listeners: {} }
+const clipboardMock = {
+  readText: vi.fn(() => ''),
+  readHTML: vi.fn(() => ''),
+  writeText: vi.fn(),
+  write: vi.fn(),
+  clear: vi.fn(),
+}
+const focusGameWindowMock = vi.fn()
 
 function emitKeydown(e: { keycode: number; ctrlKey: boolean; shiftKey: boolean; altKey: boolean }): void {
   for (const handler of uiohookState.listeners.keydown ?? []) handler(e)
@@ -51,13 +59,7 @@ const focusMockState: { focusedVersion: 1 | 2 | null; scalpelBrowserWindowFocuse
 
 vi.mock('electron', () => ({
   globalShortcut: globalShortcutMock,
-  clipboard: {
-    readText: vi.fn(() => ''),
-    readHTML: vi.fn(() => ''),
-    writeText: vi.fn(),
-    write: vi.fn(),
-    clear: vi.fn(),
-  },
+  clipboard: clipboardMock,
   ipcMain: { on: vi.fn(), handle: vi.fn() },
 }))
 
@@ -81,7 +83,7 @@ vi.mock('uiohook-napi', () => {
 
 vi.mock('./overlay', () => ({
   isTypingInOverlay: () => overlayMockState.isTypingInOverlay,
-  focusGameWindow: vi.fn(),
+  focusGameWindow: focusGameWindowMock,
   setOverlayVisibilityListener: (cb: ((visible: boolean) => void) | null) => {
     overlayMockState.visibilityListener = cb
   },
@@ -129,6 +131,7 @@ async function loadHotkeys(onEscape: () => void) {
   globalShortcutMock.unregister.mockClear()
   globalShortcutMock.unregisterAll.mockClear()
   overlayControllerState.targetHasFocus = false
+  overlayControllerState.targetBounds = null
   overlayControllerState.events.removeAllListeners()
   uiohookState.listeners = {}
   overlayMockState.isTypingInOverlay = false
@@ -137,12 +140,56 @@ async function loadHotkeys(onEscape: () => void) {
   windowingMockState.hideFocusedOrAnyVisibleSecondaryOverlay.mockReturnValue(false)
   focusMockState.focusedVersion = 1
   focusMockState.scalpelBrowserWindowFocused = false
+  clipboardMock.readText.mockReset().mockReturnValue('')
+  clipboardMock.readHTML.mockReset().mockReturnValue('')
+  clipboardMock.writeText.mockReset()
+  clipboardMock.write.mockReset()
+  clipboardMock.clear.mockReset()
+  focusGameWindowMock.mockReset()
 
   const hotkeys = await import('./hotkeys')
   hotkeys.startHotkeyListener(() => {})
   hotkeys.setEscapeHandler(onEscape)
   return hotkeys
 }
+
+describe('manual trade chat actions', () => {
+  afterEach(() => vi.useRealTimers())
+
+  it('reports a missing game without touching the clipboard', async () => {
+    const hotkeys = await loadHotkeys(() => {})
+    expect(await hotkeys.trySendTradeChatAction('@Seller hello')).toBe('game-not-found')
+    expect(clipboardMock.writeText).not.toHaveBeenCalled()
+  })
+
+  it('sends at most one localized message, suppresses a duplicate, and restores the clipboard', async () => {
+    vi.useFakeTimers()
+    const hotkeys = await loadHotkeys(() => {})
+    overlayControllerState.targetBounds = { x: 0, y: 0, width: 1920, height: 1080 }
+    overlayControllerState.targetHasFocus = true
+    clipboardMock.readText.mockReturnValue('original clipboard')
+
+    const first = hotkeys.trySendTradeChatAction('@Seller localized whisper')
+    const duplicate = await hotkeys.trySendTradeChatAction('@Seller localized whisper')
+    expect(duplicate).toBe('busy')
+
+    await vi.advanceTimersByTimeAsync(50)
+    expect(await first).toBe('sent')
+    expect(clipboardMock.writeText.mock.calls).toEqual([['@Seller localized whisper'], ['original clipboard']])
+  })
+
+  it('restores the clipboard and reports failure when game focus throws', async () => {
+    const hotkeys = await loadHotkeys(() => {})
+    overlayControllerState.targetBounds = { x: 0, y: 0, width: 1920, height: 1080 }
+    clipboardMock.readText.mockReturnValue('original clipboard')
+    focusGameWindowMock.mockImplementation(() => {
+      throw new Error('focus failed')
+    })
+
+    await expect(hotkeys.trySendTradeChatAction('@Seller hello')).rejects.toThrow('focus failed')
+    expect(clipboardMock.writeText).toHaveBeenLastCalledWith('original clipboard')
+  })
+})
 
 /** The callback passed to the most recent globalShortcut.register('Escape', cb) call. */
 function lastEscapeCallback(): () => void {
